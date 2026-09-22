@@ -1,0 +1,477 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Multi-Criteria Customer Search for Amazon Connect Customer Agent Workspace.
+  Deploys Lambda, API Gateway, S3, CloudFront (OAC), and IAM resources.
+
+Parameters:
+  ConnectInstanceId:
+    Type: String
+    Description: Your Amazon Connect Customer instance ID (e.g., xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+  CustomerProfilesDomainName:
+    Type: String
+    Description: Your Customer Profiles domain name
+  AllowedOrigins:
+    Type: String
+    Default: '*'
+    Description: >
+      Allowed CORS origin. After deployment, restrict this to your CloudFront
+      distribution URL (e.g., https://d111111abcdef8.cloudfront.net)
+
+Resources:
+  # ============================================================
+  # S3 Bucket for UI hosting (Block Public Access stays ENABLED)
+  # ============================================================
+  UIBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'connect-multi-search-ui-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  UIBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UIBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${UIBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ============================================================
+  # CloudFront Distribution with Origin Access Control (OAC)
+  # ============================================================
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'connect-multi-search-oac-${AWS::AccountId}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt UIBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: ApiGatewayOrigin
+            DomainName: !Sub '${SearchApi}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+            OriginCustomHeaders:
+              - HeaderName: x-api-key
+                HeaderValue: !Sub '{{resolve:secretsmanager:${ApiKeySecret}}}'
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          ForwardedValues:
+            QueryString: false
+        CacheBehaviors:
+          - PathPattern: /prod/*
+            TargetOriginId: ApiGatewayOrigin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            ForwardedValues:
+              QueryString: false
+              Headers: [Content-Type, Authorization]
+            DefaultTTL: 0
+            MinTTL: 0
+            MaxTTL: 0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # ============================================================
+  # Secrets Manager - generates and stores the API key value
+  # ============================================================
+  ApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'connect-multi-search-apikey-${AWS::AccountId}'
+      Description: Auto-generated API key for Connect Multi-Criteria Search
+      GenerateSecretString:
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  # ============================================================
+  # IAM Role for Lambda
+  # ============================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ConnectProfileSearchLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CustomerProfilesAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - profile:SearchProfiles
+                  - profile:AddProfileKey
+                  - profile:UpdateProfile
+                Resource: !Sub 'arn:aws:profile:${AWS::Region}:${AWS::AccountId}:domains/${CustomerProfilesDomainName}'
+              # GetCurrentUserData requires instance/* to access agent sub-resources
+              - Effect: Allow
+                Action:
+                  - connect:GetCurrentUserData
+                Resource: !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/*'
+              - Effect: Allow
+                Action:
+                  - connect:ListRoutingProfiles
+                Resource: !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ConnectMultiCriteriaSearch:*'
+
+  # ============================================================
+  # Lambda Function (inline code - no external dependencies)
+  # ============================================================
+  SearchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ConnectMultiCriteriaSearch
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          DOMAIN_NAME: !Ref CustomerProfilesDomainName
+          INSTANCE_ID: !Ref ConnectInstanceId
+          ALLOWED_ORIGINS: !Ref AllowedOrigins
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          client = boto3.client('customer-profiles')
+          connect_client = boto3.client('connect')
+
+          DOMAIN_NAME = os.environ['DOMAIN_NAME']
+          ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*')
+          INSTANCE_ID = os.environ['INSTANCE_ID']
+
+
+          def get_cors_headers():
+              return {
+                  'Access-Control-Allow-Origin': ALLOWED_ORIGINS,
+                  'Access-Control-Allow-Headers': 'Content-Type,x-api-key',
+                  'Access-Control-Allow-Methods': 'POST,OPTIONS'
+              }
+
+
+          def search_profiles(search_params):
+              keys = []
+              if search_params.get('phone'):
+                  keys.append(('_phone', [search_params['phone']]))
+              if search_params.get('email'):
+                  keys.append(('_email', [search_params['email']]))
+              if search_params.get('fullName'):
+                  keys.append(('_fullName', [search_params['fullName']]))
+              if not keys:
+                  logger.info("Search called with no criteria provided")
+                  return []
+
+              primary_key, primary_value = keys[0]
+              additional_keys = [{'KeyName': k, 'Values': v} for k, v in keys[1:]]
+              profiles = []
+              next_token = None
+
+              while True:
+                  params = {
+                      'DomainName': DOMAIN_NAME,
+                      'KeyName': primary_key,
+                      'Values': primary_value,
+                  }
+                  if additional_keys:
+                      params['AdditionalSearchKeys'] = additional_keys
+                      params['LogicalOperator'] = 'AND'
+                  if next_token:
+                      params['NextToken'] = next_token
+
+                  response = client.search_profiles(**params)
+                  profiles.extend(response.get('Items', []))
+                  next_token = response.get('NextToken')
+                  if not next_token:
+                      break
+
+              logger.info(f"Search returned {len(profiles)} profile(s)")
+              return profiles
+
+
+          def get_agent_contact_id(agent_id, context):
+              account_id = context.invoked_function_arn.split(':')[4]
+              region = os.environ['AWS_REGION']
+              agent_arn = (
+                  f"arn:aws:connect:{region}:{account_id}:"
+                  f"instance/{INSTANCE_ID}/agent/{agent_id}"
+              )
+              try:
+                  response = connect_client.get_current_user_data(
+                      InstanceId=INSTANCE_ID,
+                      Filters={'Agents': [agent_arn]}
+                  )
+              except Exception as e:
+                  logger.error(f"GetCurrentUserData failed: {type(e).__name__}: {e}")
+                  return None
+
+              for user_data in response.get('UserDataList', []):
+                  for contact in user_data.get('Contacts', []):
+                      if contact.get('AgentContactState') in ('CONNECTED', 'CONNECTED_ONHOLD'):
+                          return contact.get('ContactId')
+              logger.info("No active contact found for agent")
+              return None
+
+
+          def find_any_active_contact():
+              """Fallback: find any agent with an active contact in the instance."""
+              try:
+                  # Get all routing profiles to use as filter
+                  rp_response = connect_client.list_routing_profiles(
+                      InstanceId=INSTANCE_ID, MaxResults=100
+                  )
+                  rp_ids = [rp['Id'] for rp in rp_response.get('RoutingProfileSummaryList', [])]
+                  if not rp_ids:
+                      logger.info("No routing profiles found")
+                      return None
+
+                  response = connect_client.get_current_user_data(
+                      InstanceId=INSTANCE_ID,
+                      Filters={'RoutingProfiles': rp_ids}
+                  )
+              except Exception as e:
+                  logger.error(f"find_any_active_contact failed: {type(e).__name__}: {e}")
+                  return None
+
+              for user_data in response.get('UserDataList', []):
+                  for contact in user_data.get('Contacts', []):
+                      if contact.get('AgentContactState') in ('CONNECTED', 'CONNECTED_ONHOLD'):
+                          return contact.get('ContactId')
+              logger.info("No active contacts found in instance")
+              return None
+              return None
+
+
+          def associate_profile(profile_id, contact_id, update_fields=None):
+              if update_fields:
+                  try:
+                      client.update_profile(
+                          DomainName=DOMAIN_NAME,
+                          ProfileId=profile_id,
+                          **update_fields
+                      )
+                  except Exception as e:
+                      logger.error(f"UpdateProfile failed for profile {profile_id}: {type(e).__name__}: {e}")
+                      raise
+
+              try:
+                  client.add_profile_key(
+                      DomainName=DOMAIN_NAME,
+                      ProfileId=profile_id,
+                      KeyName='_ctrContactId',
+                      Values=[contact_id]
+                  )
+              except client.exceptions.BadRequestException as e:
+                  if 'already exists' in str(e).lower() or 'duplicate' in str(e).lower():
+                      logger.info(f"Profile {profile_id} already associated with contact {contact_id}")
+                      if not update_fields:
+                          return {'success': False, 'message': 'Already associated with this contact'}
+                  else:
+                      logger.error(f"AddProfileKey failed: {type(e).__name__}: {e}")
+                      raise
+
+              msg = 'Profile updated and associated' if update_fields else 'Profile associated'
+              return {'success': True, 'message': msg, 'profileId': profile_id, 'contactId': contact_id}
+
+
+          def lambda_handler(event, context):
+              if event.get('httpMethod') == 'OPTIONS':
+                  return {'statusCode': 200, 'headers': get_cors_headers(), 'body': ''}
+
+              try:
+                  body = json.loads(event.get('body', '{}'))
+
+                  if body.get('associate'):
+                      contact_id = body.get('contactId')
+                      if not contact_id and body.get('agentId'):
+                          contact_id = get_agent_contact_id(body['agentId'], context)
+                      if not contact_id:
+                          contact_id = find_any_active_contact()
+
+                      if not contact_id:
+                          logger.warning("Associate called but no active contact found")
+                          return {
+                              'statusCode': 400,
+                              'headers': get_cors_headers(),
+                              'body': json.dumps({'success': False, 'message': 'No active contact found'})
+                          }
+
+                      update_fields = {}
+                      if body.get('updatePhone'):
+                          update_fields['PhoneNumber'] = body['updatePhone']
+                      if body.get('updateEmail'):
+                          update_fields['EmailAddress'] = body['updateEmail']
+                      if body.get('updateName'):
+                          parts = body['updateName'].split(' ', 1)
+                          update_fields['FirstName'] = parts[0]
+                          if len(parts) > 1:
+                              update_fields['LastName'] = parts[1]
+
+                      result = associate_profile(
+                          body['id'], contact_id, update_fields if update_fields else None
+                      )
+                      status_code = 200 if result['success'] else 409
+                      return {
+                          'statusCode': status_code,
+                          'headers': get_cors_headers(),
+                          'body': json.dumps(result)
+                      }
+
+                  profiles = search_profiles(body)
+                  return {
+                      'statusCode': 200,
+                      'headers': get_cors_headers(),
+                      'body': json.dumps({'profiles': profiles, 'count': len(profiles)}, default=str)
+                  }
+
+              except Exception as e:
+                  logger.error(f"Unhandled error: {type(e).__name__}: {e}")
+                  return {
+                      'statusCode': 500,
+                      'headers': get_cors_headers(),
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+
+  # ============================================================
+  # API Gateway with API Key authentication
+  # ============================================================
+  SearchApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ConnectProfileSearchAPI
+
+  SearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SearchApi
+      ParentId: !GetAtt SearchApi.RootResourceId
+      PathPart: search
+
+  SearchPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SearchApi
+      ResourceId: !Ref SearchResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchFunction.Arn}/invocations'
+
+  SearchOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SearchApi
+      ResourceId: !Ref SearchResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchFunction.Arn}/invocations'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SearchPostMethod
+      - SearchOptionsMethod
+    Properties:
+      RestApiId: !Ref SearchApi
+      StageName: prod
+
+  # API Key and Usage Plan
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiDeployment
+    Properties:
+      Name: !Sub 'ConnectMultiSearchApiKey-${AWS::StackName}'
+      Enabled: true
+      Value: !Sub '{{resolve:secretsmanager:${ApiKeySecret}}}'
+      StageKeys:
+        - RestApiId: !Ref SearchApi
+          StageName: prod
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiDeployment
+    Properties:
+      UsagePlanName: ConnectMultiSearchUsagePlan
+      ApiStages:
+        - ApiId: !Ref SearchApi
+          Stage: prod
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SearchFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SearchApi}/*'
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL (internal - accessed via CloudFront proxy)
+    Value: !Sub 'https://${SearchApi}.execute-api.${AWS::Region}.amazonaws.com/prod/search'
+  CloudFrontURL:
+    Description: CloudFront distribution URL (use for Approved Origins and Third-Party App)
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+  BucketName:
+    Description: S3 bucket name for uploading UI files
+    Value: !Ref UIBucket
